@@ -531,3 +531,114 @@ turn_switch
 ```
 
 All modes include `demo_clean` and `demo_randomized`.
+
+## PI goal-pose/time ablations and offline action errors
+
+`train_files/run_three_methods.sh` compares these inputs at each H=1,2,4,8,16:
+
+| Condition | Inputs in addition to images, instruction, and proprioceptive state |
+| --- | --- |
+| `baseline` | None |
+| `goal` | Full dual-arm goal pose: 2 × `[x,y,z,qw,qx,qy,qz]` |
+| `goal_time` | Full dual-arm goal pose and time budget in seconds |
+
+Each of the 15 models is trained independently, then evaluated. The time input
+is `(target_frame-frame_index)/fps`, with fps read from the dataset metadata
+(15 Hz for this data). It is the expert-demonstration interval to the goal,
+independent of output horizon H and the flow-matching denoising timestep.
+For example, a goal 60 frames ahead gives 4 seconds, while H=8 still predicts
+the next 8 continuous actions. The budget is a conditioning hint; this does not
+make the model generate every action through the goal frame. The goal and its
+interval were sampled when converting each row; they stay fixed across epochs.
+No data reconversion is needed to derive this time from saved frame indices.
+
+All runs use current proprioceptive state, the same episode split, start frames,
+initialization seed, optimizer settings, training budget, and FM repeat=2.
+The different horizons are fixed per run; this is not mixed-length training.
+
+From the repository root, prepare and inspect the commands without using GPUs:
+
+```bash
+conda activate /var/tmp/jliu3375/miniconda3/envs/starVLA
+bash examples/simBenchmarks/Robotwin/train_files/run_three_methods.sh \
+  --profile smoke \
+  --run-root /var/tmp/jliu3375/robotwin_three_methods_smoke
+```
+
+Add `--execute` to train. Add `--download-model` to first download the configured
+Qwen3-VL-4B-Instruct weights if they are missing. Runs execute serially on GPUs
+0,2,3,7; offline evaluation uses the first
+GPU. Set `--gpus` to change this selection. The default smoke profile uses 50
+updates, warmup 5, per-GPU batch 1, and the first 5 input frames per episode.
+Use `--horizons 16` to start with just the three H=16 models.
+`STARVLA_PYTHON` can override the launcher Python executable.
+The three-method wrapper defaults `NCCL_NVLS_ENABLE=0` for this H100 node:
+the default NVLink SHARP initialization fails with CUDA 401 in a minimal
+four-GPU test, while disabling NVLS passes barrier and all-reduce on GPUs
+0,2,3,7. Ordinary GPU P2P remains enabled. Set an explicit
+`NCCL_NVLS_ENABLE=1` to override this workaround after the node is repaired.
+
+Run in the background from the repository root:
+
+```bash
+nohup bash examples/simBenchmarks/Robotwin/train_files/run_three_methods.sh \
+  --profile smoke --download-model --execute \
+  > /var/tmp/jliu3375/robotwin_three_methods_smoke.log 2>&1 < /dev/null &
+echo $! > /var/tmp/jliu3375/robotwin_three_methods_smoke.pid
+```
+
+Read progress with `tail -f /var/tmp/jliu3375/robotwin_three_methods_smoke.log`.
+Stop this suite with `kill "$(cat /var/tmp/jliu3375/robotwin_three_methods_smoke.pid)"`;
+the runner also terminates its current training/evaluation child processes.
+The generic `run_ablation.sh` uses a single baseline at the largest H by default
+(11 models); `--matched-baselines` gives the same 15-model plan as the wrapper.
+`--conditions baseline goal` selects the original two-condition comparison.
+
+The currently prepared single-episode probe only supports training-replay
+diagnostics. The manifest and results explicitly label that case as
+`train_replay_smoke`; its numbers are not held-out performance. For a formal
+comparison, first convert at least two episodes (preferably the full task's 50)
+with the modified converter, retaining complete trajectories, `ee_pose`,
+`target_pose`, and `target_frame`. Then inspect a separate suite:
+
+```bash
+bash examples/simBenchmarks/Robotwin/train_files/run_three_methods.sh \
+  --profile formal \
+  --source-dataset /path/to/converted/adjust_bottle \
+  --run-root /var/tmp/jliu3375/robotwin_three_methods_formal
+```
+
+Formal defaults are 150000 updates, warmup 5000, and per-GPU batch 8 (global 32
+on four GPUs with accumulation 1). All are explicit CLI options. Episode splits
+default to 80/20. Data views use symlinks and independent metadata so training
+normalization statistics exclude validation episodes. All horizons share the
+start-frame range determined by the maximum H. `--all-frames` expands beyond
+the default first 5 frames; keep that choice identical across compared models.
+
+Each suite writes `suite.json`, `prepared/manifest.json`, generated `configs/`,
+commands, logs, per-run `metrics/*.json`, and `summary.csv`. Metrics include:
+
+- True normalized action MSE and MAE over the model's full H.
+- First-action MSE/MAE, which provides a common prefix across all H values.
+- Physical joint errors (rad/rad²) and gripper errors (unitless), reported
+  separately; physical targets come directly from raw actions.
+- Per-step, per-dimension, and per-episode details.
+
+Validation observations and labels use the checkpoint's **training** statistics.
+Checkpoint loading restores settings from `config.full.yaml` and overlays the
+saved runtime values from `config.yaml`. The latter is an accessed-only snapshot
+and can omit settings first read during sampling, such as `include_state`.
+This keeps proprioception and image preprocessing consistent with training;
+legacy checkpoints without a full snapshot still use `config.yaml` alone.
+The goal comes from a future expert frame and is explicitly marked as an oracle
+goal. Action errors do not measure goal-pose error or RoboTwin closed-loop task
+success. Compare the three conditions at the same H to isolate the input changes;
+full-H errors for H=1 and H=16 describe different prediction tasks.
+
+Use `--resume-suite` to skip completed stages of an identical suite. Interrupted
+optimizer-state resumption is not implemented. New settings require a new run
+root. After a failed run has created a nonempty training directory, retry with
+a new `--run-root` to keep the failed run's logs and artifacts intact.
+Full model checkpoints are large, so the default output location is on
+`/var/tmp`, rather than the home quota. No GPU training is launched without
+`--execute`.

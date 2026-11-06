@@ -57,6 +57,41 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.layer2(F.relu(self.layer1(x)))
 
+class GoalPoseEncoder(nn.Module):
+    def __init__(self, pose_dim, hidden_size, hidden_dim=1024):
+        super().__init__()
+        self.pose_dim = pose_dim
+        self.layer1 = nn.Linear(pose_dim, hidden_dim)
+        self.layer2 = nn.Linear(hidden_dim, hidden_size)
+
+    def forward(self, target_pose):
+        """
+        target_pose: shape (B, 1, pose_dim)
+        """
+        if target_pose.ndim != 3 or target_pose.shape[1:] != (1, self.pose_dim):
+            raise ValueError(
+                f"Expected (B, 1, {self.pose_dim}), "
+                f"got {tuple(target_pose.shape)}"
+            )
+
+        return self.layer2(F.relu(self.layer1(target_pose)))
+
+
+class TimeBudgetEncoder(nn.Module):
+    """Encode positive task time in seconds, separately from FM denoising time."""
+
+    def __init__(self, hidden_size, hidden_dim=1024):
+        super().__init__()
+        self.layer1 = nn.Linear(1, hidden_dim)
+        self.layer2 = nn.Linear(hidden_dim, hidden_size)
+
+    def forward(self, time_budget):
+        if time_budget.ndim != 3 or time_budget.shape[1:] != (1, 1):
+            raise ValueError(f"Expected time_budget shape (B, 1, 1), got {tuple(time_budget.shape)}")
+        if not torch.isfinite(time_budget).all() or (time_budget <= 0).any():
+            raise ValueError("time_budget must contain positive finite seconds")
+        return self.layer2(F.relu(self.layer1(time_budget)))
+
 
 class ActionEncoder(nn.Module):
     def __init__(self, action_dim, hidden_size=1024):
@@ -277,6 +312,43 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self.beta_dist = Beta(action_config.noise_beta_alpha, action_config.noise_beta_beta)
         self.num_timestep_buckets = action_config.num_timestep_buckets
         self.config = action_config
+        self.target_pose_dim = int(
+            getattr(action_config, "target_pose_dim", 0)
+        )
+
+        self.goal_encoder = (
+            GoalPoseEncoder(
+                pose_dim=self.target_pose_dim,
+                hidden_size=self.input_embedding_dim,
+            )
+            if self.target_pose_dim > 0
+            else None
+        )
+
+        self.use_time_budget = getattr(action_config, "use_time_budget", False)
+        if type(self.use_time_budget) is not bool:
+            raise ValueError("use_time_budget must be a boolean")
+        if self.use_time_budget and self.goal_encoder is None:
+            raise ValueError("Time conditioning requires target_pose_dim > 0")
+        # Create this last so existing PI/goal weights keep their seeded initialization.
+        self.time_budget_encoder = (
+            TimeBudgetEncoder(hidden_size=self.input_embedding_dim)
+            if self.use_time_budget else None
+        )
+
+    def _encode_time_budget(self, time_budget, reference):
+        if not self.use_time_budget:
+            if time_budget is not None:
+                raise ValueError("Set use_time_budget=True before supplying time_budget")
+            return None
+        if time_budget is None:
+            raise ValueError("time_budget is required for the goal-and-time model")
+        expected = (reference.shape[0], 1, 1)
+        if tuple(time_budget.shape) != expected:
+            raise ValueError(f"Expected time_budget shape {expected}, got {tuple(time_budget.shape)}")
+        return self.time_budget_encoder(
+            time_budget.to(device=reference.device, dtype=reference.dtype)
+        )
 
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
@@ -291,6 +363,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         actions: torch.Tensor,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
+        target_pose: torch.Tensor = None,
+        time_budget: torch.Tensor = None,
     ):
         """
         vl_embs: list of torch.Tensor, each shape (B, seq_length, feature_dim)
@@ -315,6 +389,34 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         # Embed state
         state_features = self.state_encoder(state) if state is not None else None
 
+        goal_features = None
+
+        if self.goal_encoder is not None:
+            if target_pose is None:
+                raise ValueError("target_pose is required for the goal model")
+
+            if (
+                not self.model._interleave_self_attention
+                or len(self.model.transformer_blocks) < 2
+            ):
+                raise ValueError(
+                    "Goal input requires self attention and at least 2 layers"
+                )
+
+            if target_pose.shape[0] != actions.shape[0]:
+                raise ValueError(
+                    "target_pose and actions must have the same batch size"
+                )
+
+            goal_features = self.goal_encoder(
+                target_pose.to(device=actions.device, dtype=actions.dtype)
+            )
+
+        elif target_pose is not None:
+            raise ValueError("Set target_pose_dim > 0 to enable goal input")
+
+        time_features = self._encode_time_budget(time_budget, actions)
+
         # Maybe add position embedding.
         if self.config.add_pos_embed:
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
@@ -323,10 +425,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         # state and action embedding along sequence dimension.
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1)
-        sa_embs = (
-            torch.cat((state_features, future_tokens, action_features), dim=1)
-            if state_features is not None
-            else torch.cat((future_tokens, action_features), dim=1)
+        condition_tokens = [
+            x for x in (state_features, goal_features, time_features) if x is not None
+        ]
+
+        sa_embs = torch.cat(
+            condition_tokens + [future_tokens, action_features],
+            dim=1,
         )
 
         # Layer-wise DiT forward. DiT handles cross/self-attention interleaving.
@@ -352,6 +457,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         vl_embs_list: list,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
+        target_pose: torch.Tensor = None,
+        time_budget: torch.Tensor = None,
     ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs_list[0].shape[0]
@@ -366,6 +473,34 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         dt = 1.0 / num_steps
 
         state_features = self.state_encoder(state) if state is not None else None
+
+        goal_features = None
+
+        if self.goal_encoder is not None:
+            if target_pose is None:
+                raise ValueError("target_pose is required for the goal model")
+
+            if (
+                not self.model._interleave_self_attention
+                or len(self.model.transformer_blocks) < 2
+            ):
+                raise ValueError(
+                    "Goal input requires self attention and at least 2 layers"
+                )
+
+            if target_pose.shape[0] != actions.shape[0]:
+                raise ValueError(
+                    "target_pose and actions must have the same batch size"
+                )
+
+            goal_features = self.goal_encoder(
+                target_pose.to(device=actions.device, dtype=actions.dtype)
+            )
+
+        elif target_pose is not None:
+            raise ValueError("Set target_pose_dim > 0 to enable goal input")
+
+        time_features = self._encode_time_budget(time_budget, actions)
 
         # Run denoising steps.
         for t in range(num_steps):
@@ -385,10 +520,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 action_features = action_features + pos_embs
 
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(batch_size, -1, -1)
-            sa_embs = (
-                torch.cat((state_features, future_tokens, action_features), dim=1)
-                if state_features is not None
-                else torch.cat((future_tokens, action_features), dim=1)
+            condition_tokens = [
+                x for x in (state_features, goal_features, time_features) if x is not None
+            ]
+
+            sa_embs = torch.cat(
+                condition_tokens + [future_tokens, action_features],
+                dim=1,
             )
 
             # Layer-wise DiT forward. DiT handles cross/self-attention interleaving.
@@ -445,6 +583,11 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         Returns:
             actions: (B, action_horizon, action_dim) predicted actions.
         """
+
+        if self.target_pose_dim > 0:
+            raise NotImplementedError(
+                "Goal-conditioned RTC is not supported; use predict_action"
+        )
         if prev_action_chunk is None or inference_delay <= 0:
             return self.predict_action(
                 vl_embs_list,

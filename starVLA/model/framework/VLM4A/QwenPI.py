@@ -74,6 +74,8 @@ class QwenPIDefaultConfig:
             "action_dim": 7,
             # State dimension (proprioception input)
             "state_dim": 7,
+            "target_pose_dim": 0,
+            "use_time_budget": False,
             # Canonical chunk length (number of action steps the head predicts).
             # Legacy YAMLs may use future_action_window_size = action_horizon - 1;
             # apply_config_compat normalises both directions.
@@ -203,6 +205,16 @@ class Qwen_PI(baseframework):
         actions = [example["action"] for example in examples]  # label [B, len, 7]
 
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+        target_pose = None
+        if self.action_model.target_pose_dim > 0:
+            target_pose = np.stack(
+                [example["target_pose"] for example in examples],
+                axis=0,
+            )
+
+        time_budget = None
+        if self.action_model.use_time_budget:
+            time_budget = np.stack([example["time_budget"] for example in examples], axis=0)
 
         # Step 1: encode through QwenVL
         vl_embs_list, backbone_attention_mask = self._encode_vl_hidden_states(batch_images, instructions)
@@ -235,11 +247,31 @@ class Qwen_PI(baseframework):
                 state = torch.tensor(np.array(state), device=base_hidden.device, dtype=base_hidden.dtype)
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
+            target_pose_repeated = None
+            if target_pose is not None:
+                target_pose = torch.as_tensor(
+                    target_pose,
+                    device=base_hidden.device,
+                    dtype=base_hidden.dtype,
+                )
+                target_pose_repeated = target_pose.repeat(
+                    repeated_diffusion_steps, 1, 1
+                )
+
+            time_budget_repeated = None
+            if time_budget is not None:
+                time_budget = torch.as_tensor(
+                    time_budget, device=base_hidden.device, dtype=base_hidden.dtype
+                )
+                time_budget_repeated = time_budget.repeat(repeated_diffusion_steps, 1, 1)
+
             action_loss = self.action_model(
                 vl_embs_list_repeated,
                 actions_target_repeated,
                 state_repeated,
                 encoder_attention_mask=backbone_attention_mask,
+                target_pose=target_pose_repeated,
+                time_budget=time_budget_repeated,
             )  # (B, chunk_len, action_dim)
 
         return {"action_loss": action_loss}
@@ -270,6 +302,17 @@ class Qwen_PI(baseframework):
 
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
 
+        target_pose = None
+        if self.action_model.target_pose_dim > 0:
+            target_pose = np.stack(
+                [example["target_pose"] for example in examples],
+                axis=0,
+            )
+
+        time_budget = None
+        if self.action_model.use_time_budget:
+            time_budget = np.stack([example["time_budget"] for example in examples], axis=0)
+
         train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
@@ -285,13 +328,28 @@ class Qwen_PI(baseframework):
             if state is not None
             else None
         )
+
+        if target_pose is not None:
+            target_pose = torch.as_tensor(
+                target_pose,
+                device=base_hidden.device,
+                dtype=base_hidden.dtype,
+            )
+        if time_budget is not None:
+            time_budget = torch.as_tensor(
+                time_budget, device=base_hidden.device, dtype=base_hidden.dtype
+            )
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
             pred_actions = self.action_model.predict_action(
-                vl_embs_list, state, encoder_attention_mask=backbone_attention_mask
+                vl_embs_list,
+                state,
+                encoder_attention_mask=backbone_attention_mask,
+                target_pose=target_pose,
+                time_budget=time_budget,
             )  # (B, chunk_len, action_dim)
 
-        normalized_actions = pred_actions.detach().cpu().numpy()
+        normalized_actions = pred_actions.detach().float().cpu().numpy()
         return {"normalized_actions": normalized_actions}
 
     @torch.inference_mode()
@@ -358,7 +416,7 @@ class Qwen_PI(baseframework):
                 **kwargs,
             )
 
-        normalized_actions = pred_actions.detach().cpu().numpy()
+        normalized_actions = pred_actions.detach().float().cpu().numpy()
         return {"normalized_actions": normalized_actions}
 
 

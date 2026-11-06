@@ -40,6 +40,14 @@ def make_LeRobotSingleDataset(
     
     data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
     modality_config = data_config.modality_config()
+    # Match future labels to the requested model horizon without changing the registry.
+    action_horizon = data_cfg.get("action_horizon") if data_cfg is not None else None
+    if action_horizon is not None:
+        if type(action_horizon) is not int or action_horizon <= 0:
+            raise ValueError("datasets.vla_data.action_horizon must be a positive integer")
+        modality_config["action"] = modality_config["action"].model_copy(
+            update={"delta_indices": list(range(action_horizon))}
+        )
     transforms = data_config.transform()
     dataset_path = data_root_dir / data_name
     embodiment_tag = getattr(data_config, "embodiment_tag", None)

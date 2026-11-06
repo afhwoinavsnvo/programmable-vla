@@ -115,7 +115,7 @@ class ModelClient:
         images = [self._resize_image(image) for image in images]
         example["image"] = images
         example_copy = example.copy()
-        example_copy.pop("state")
+        # example_copy.pop("state")
         vla_input = {
             "examples": [example_copy],
             "do_sample": False,

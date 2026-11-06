@@ -391,12 +391,17 @@ class VLATrainer(TrainerUtils):
             examples=examples, use_ddim=True, num_ddim_steps=20
         )
 
+        normalized_actions = np.asarray(output_dict["normalized_actions"], dtype=np.float64)
+        actions = np.asarray(actions, dtype=np.float64)
+        if normalized_actions.shape != actions.shape:
+            raise ValueError(
+                f"Prediction/label shapes differ: {normalized_actions.shape} vs {actions.shape}"
+            )
         if self.accelerator.is_main_process:
-            normalized_actions = output_dict["normalized_actions"]
-            actions = np.array(actions)
-            num_pots = np.prod(actions.shape)
-            score = TrainerUtils.euclidean_distance(normalized_actions, actions)
-            step_metrics["mse_score"] = score / num_pots
+            error = normalized_actions - actions
+            # Training-batch diagnostics; held-out evaluation is run separately.
+            step_metrics["train_action_mse"] = float(np.mean(error ** 2))
+            step_metrics["train_action_mae"] = float(np.mean(np.abs(error)))
 
         del examples
         if dist.is_initialized():
@@ -473,6 +478,8 @@ def main(cfg) -> None:
     logger.info("✅ Configuration wrapped for access tracking")
 
     output_dir = setup_directories(cfg=cfg)
+    # Match shared initial weights across ablations before rank-specific noise seeds.
+    set_seed(int(cfg.seed))
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)

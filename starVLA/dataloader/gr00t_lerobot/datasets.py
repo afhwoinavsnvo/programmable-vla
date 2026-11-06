@@ -593,6 +593,7 @@ class LeRobotSingleDataset(Dataset):
         """
         # first check if the path directory exists
         self.data_cfg = data_cfg
+        self._time_budget_enabled()
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
         # indict letobot version
@@ -1376,8 +1377,21 @@ class LeRobotSingleDataset(Dataset):
         data = self.transforms(raw_data)
         return self._pack_sample(data)
 
+    def _time_budget_enabled(self) -> bool:
+        enabled = (
+            self.data_cfg.get("include_time_budget", False)
+            if self.data_cfg is not None
+            else False
+        )
+        if not isinstance(enabled, bool):
+            raise ValueError("include_time_budget must be a boolean")
+        if enabled and self.data_cfg.get("include_target_pose", False) is not True:
+            raise ValueError("include_time_budget=True requires include_target_pose=True")
+        return enabled
+
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
+        include_time_budget = self._time_budget_enabled()
         state_action_dtype = (
             self.data_cfg.get("state_action_dtype", "float16")
             if self.data_cfg is not None
@@ -1433,6 +1447,23 @@ class LeRobotSingleDataset(Dataset):
                 state = np.concatenate(state, axis=1).astype(state_action_dtype)
                 sample["state"] = state
 
+        if self.data_cfg is not None and self.data_cfg.get("include_target_pose", False):
+            sample["target_pose"] = data["target_pose"]
+            sample["target_frame"] = data["target_frame"]
+            sample["frame_index"] = data["frame_index"]
+
+        if include_time_budget:
+            if "time_budget" not in data:
+                raise ValueError("include_time_budget=True but the raw sample has no time_budget")
+            time_budget = np.asarray(data["time_budget"], dtype=np.float32)
+            if (
+                time_budget.shape != (1, 1)
+                or not np.isfinite(time_budget).all()
+                or (time_budget <= 0).any()
+            ):
+                raise ValueError("time_budget must have shape (1, 1) and contain positive finite seconds")
+            sample["time_budget"] = time_budget
+
         return sample
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
@@ -1461,6 +1492,7 @@ class LeRobotSingleDataset(Dataset):
                 },
             }
         """
+        include_time_budget = self._time_budget_enabled()
         data = {}
         # Get the data for all modalities # just for action base data
         self.curr_traj_data = self.get_trajectory_data(trajectory_id)
@@ -1470,6 +1502,41 @@ class LeRobotSingleDataset(Dataset):
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
         data = self._apply_action_mode(data)
+        if self.data_cfg is not None and self.data_cfg.get("include_target_pose", False):
+            row = self.curr_traj_data.iloc[base_index]
+
+            target_pose = np.asarray(
+                row["observation.target_pose"], dtype=np.float32
+            )
+            if target_pose.shape != (14,):
+                raise ValueError(
+                    f"Expected target_pose shape (14,), got {target_pose.shape}"
+                )
+
+            data["target_pose"] = target_pose[None, :]
+            data["target_frame"] = int(
+                np.asarray(row["observation.target_frame"]).item()
+            )
+            data["frame_index"] = int(
+                np.asarray(row["frame_index"]).item()
+            )
+
+        if include_time_budget:
+            fps_value = self.lerobot_info_meta.get("fps")
+            try:
+                fps = float(fps_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("time_budget requires a positive finite dataset metadata fps") from exc
+            if isinstance(fps_value, (bool, np.bool_)) or not np.isfinite(fps) or fps <= 0:
+                raise ValueError("time_budget requires a positive finite dataset metadata fps")
+            interval = data["target_frame"] - data["frame_index"]
+            if interval <= 0:
+                raise ValueError("time_budget requires a strictly future target_frame")
+            time_budget = np.asarray([[interval / fps]], dtype=np.float32)
+            if not np.isfinite(time_budget).all() or (time_budget <= 0).any():
+                raise ValueError("time_budget must be representable as positive finite float32 seconds")
+            data["time_budget"] = time_budget
+
         return data
 
     def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
@@ -2226,7 +2293,11 @@ class LeRobotMixtureDataset(Dataset):
         self.mode = mode
         self.data_cfg = kwargs["data_cfg"] if "data_cfg" in kwargs else None
         self.drop_incomplete_action_chunks = bool(
-            self.data_cfg.get("drop_incomplete_action_chunks", False)
+            (
+                self.data_cfg.get("drop_incomplete_action_chunks", False)
+                or self.data_cfg.get("train_start_frames") is not None
+                or self.data_cfg.get("include_target_pose", False)
+            )
             if self.data_cfg is not None
             else False
         )
@@ -2243,13 +2314,31 @@ class LeRobotMixtureDataset(Dataset):
                 offsets = np.concatenate(offsets) if offsets else np.array([], dtype=np.int64)
                 min_offset = int(offsets.min()) if offsets.size else 0
                 max_offset = int(offsets.max()) if offsets.size else 0
+                # Compare horizons using the same eligible start frames.
+                sampling_horizon = self.data_cfg.get("sampling_action_horizon")
+                if sampling_horizon is not None:
+                    if type(sampling_horizon) is not int or sampling_horizon <= 0:
+                        raise ValueError("sampling_action_horizon must be a positive integer")
+                    max_offset = max(max_offset, sampling_horizon - 1)
                 valid_start = max(0, -min_offset)
                 end_trim = max(0, max_offset)
+                lengths = np.asarray(
+                    dataset.trajectory_lengths, dtype=np.int64
+                )
+                valid_end = lengths - end_trim
+                if self.data_cfg.get("include_target_pose", False):
+                    valid_end = np.minimum(valid_end, lengths - 1)
+
+                first_k = self.data_cfg.get("train_start_frames")
+                if first_k is not None:
+                    if type(first_k) is not int or first_k <= 0:
+                        raise ValueError(
+                            "train_start_frames must be a positive integer"
+                        )
+                    valid_end = np.minimum(valid_end, first_k)
+
                 effective_lengths = np.maximum(
-                    np.asarray(dataset.trajectory_lengths, dtype=np.int64)
-                    - valid_start
-                    - end_trim,
-                    0,
+                    valid_end - valid_start, 0
                 )
                 if not np.any(effective_lengths > 0):
                     raise ValueError(
@@ -2404,7 +2493,9 @@ class LeRobotMixtureDataset(Dataset):
         # Sample step
         if self.drop_incomplete_action_chunks:
             valid_start, end_trim = self._valid_step_bounds[dataset_index]
-            valid_end_exclusive = int(dataset.trajectory_lengths[trajectory_index]) - end_trim
+            valid_end_exclusive = valid_start + int(
+                self._effective_trajectory_lengths[dataset_index][trajectory_index]
+            )
             base_index = int(rng.integers(valid_start, valid_end_exclusive))
         else:
             base_index = rng.choice(dataset.trajectory_lengths[trajectory_index])

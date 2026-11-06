@@ -356,7 +356,13 @@ def read_model_config(pretrained_checkpoint):
 
 def read_mode_config(pretrained_checkpoint):
     """
-    Same as read_model_config (legacy duplicate kept for backward compatibility).
+    Load a checkpoint's YAML configuration and normalization statistics.
+
+    ``config.yaml`` can be an accessed-only snapshot written before the first
+    training batch. Restore omitted input/preprocessing settings from
+    ``config.full.yaml`` when present, with explicitly saved runtime values in
+    ``config.yaml`` taking precedence. Legacy runs without a full snapshot
+    continue to use ``config.yaml`` alone.
 
     Args:
         pretrained_checkpoint: Path to a .pt checkpoint file.
@@ -383,6 +389,10 @@ def read_mode_config(pretrained_checkpoint):
         # Load VLA Config (and corresponding base VLM `ModelConfig`) from `config.json`
         try:
             ocfg = OmegaConf.load(str(config_yaml))
+            full_config_yaml = run_dir / "config.full.yaml"
+            if full_config_yaml.is_file():
+                full_cfg = OmegaConf.load(str(full_config_yaml))
+                ocfg = OmegaConf.merge(full_cfg, ocfg)
             # Normalise legacy / pre-v0.21 configs to current schema (idempotent).
             apply_config_compat(ocfg)
             global_cfg = OmegaConf.to_container(ocfg, resolve=True)
